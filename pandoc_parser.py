@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Tuple
 
 import config
+import subagent_cleaner
 
 logger = logging.getLogger(__name__)
 
@@ -581,6 +582,15 @@ def _drop_problem_segment(text: str, line_num: int, window: int, attempt: int) -
     return "\n".join(lines), f"window:{window_size}"
 
 
+def _normalize_fallback_mode(mode: Optional[str]) -> str:
+    if not mode:
+        mode = getattr(config, "SUBAGENT_FALLBACK_MODE", "rule_then_llm")
+    normalized = str(mode).strip().lower()
+    if normalized not in {"rule_then_llm", "llm_only", "rule_only"}:
+        return "rule_then_llm"
+    return normalized
+
+
 def _pandoc_to_ast_with_recovery(cleaned_content: str, extra_args: List[str]) -> Tuple[Optional[Dict[str, Any]], str]:
     max_attempts = max(0, int(getattr(config, "PANDOC_RECOVERY_MAX_ATTEMPTS", 5)))
     window = max(1, int(getattr(config, "PANDOC_RECOVERY_WINDOW", 3)))
@@ -605,10 +615,12 @@ def _pandoc_to_ast_with_recovery(cleaned_content: str, extra_args: List[str]) ->
             working = new_text
 
 
-def parse_project_to_text(main_tex_file: Path) -> str:
+def parse_project_to_text_with_meta(
+    main_tex_file: Path, fallback_mode: Optional[str] = None
+) -> Tuple[str, Dict[str, Any]]:
     """
-    Parses a LaTeX project, flattens it, and converts it to a single plain text string,
-    preserving main content while skipping appendix and references.
+    Parses a LaTeX project, flattens it, and converts it to plain text.
+    Returns (text, meta).
     """
     if not main_tex_file.exists():
         raise FileNotFoundError(f"Main .tex file not found: {main_tex_file}")
@@ -625,10 +637,9 @@ def parse_project_to_text(main_tex_file: Path) -> str:
 
     # Remove complex \texttt macro if it exists, as it can break Pandoc parsing
     texttt_pattern = re.compile(r'\\renewcommand{\\texttt}.*?^}', re.DOTALL | re.MULTILINE)
-    cleaned_content = texttt_pattern.sub('', flattened_content)
+    cleaned_content = texttt_pattern.sub("", flattened_content)
 
     logger.info("Converting flattened LaTeX to Pandoc JSON AST...")
-    # Define path to the Lua filter and add it to pandoc's arguments if it exists
     script_dir = Path(__file__).parent
     lua_filter_path = script_dir / "filters" / "remove_commands.lua"
 
@@ -640,25 +651,52 @@ def parse_project_to_text(main_tex_file: Path) -> str:
         logger.warning(f"Lua filter not found at {lua_filter_path}. Proceeding without it.")
 
     ast, recovered_content = _pandoc_to_ast_with_recovery(cleaned_content, extra_args)
+    normalized_mode = _normalize_fallback_mode(fallback_mode)
+
     if ast is None:
-        # Fallback to a best-effort plain-text extraction on the recovered content
-        return _fallback_plain_text(recovered_content)
+        rule_text = _fallback_plain_text(recovered_content)
+        min_len = int(getattr(config, "SUBAGENT_MIN_OUTPUT_CHARS", 200))
+        llm_used = False
+        llm_text = None
+
+        if normalized_mode == "llm_only":
+            llm_text = subagent_cleaner.clean_latex_with_llm(recovered_content, config)
+        elif normalized_mode == "rule_then_llm" and len(rule_text) < min_len:
+            llm_text = subagent_cleaner.clean_latex_with_llm(recovered_content, config)
+
+        if llm_text:
+            llm_used = True
+            return llm_text, {
+                "pandoc_failed": True,
+                "fallback_used": True,
+                "fallback_mode": normalized_mode,
+                "llm_used": llm_used,
+                "engine": "pandoc",
+            }
+
+        return rule_text, {
+            "pandoc_failed": True,
+            "fallback_used": True,
+            "fallback_mode": normalized_mode,
+            "llm_used": llm_used,
+            "engine": "pandoc",
+        }
 
     cleaned_content = recovered_content
 
     logger.info("Extracting text from Pandoc AST...")
-    
+
     math_store: Dict[str, str] = {}
 
-    # Extract title and abstract from metadata
-    title = _inlines_to_text(ast['meta'].get('title', {}).get('c', []), math_store) if config.KEEP_TITLE else ""
-    abstract = _inlines_to_text(ast['meta'].get('abstract', {}).get('c', []), math_store) if config.KEEP_ABSTRACT else ""
+    title = _inlines_to_text(ast["meta"].get("title", {}).get("c", []), math_store) if config.KEEP_TITLE else ""
+    abstract = (
+        _inlines_to_text(ast["meta"].get("abstract", {}).get("c", []), math_store) if config.KEEP_ABSTRACT else ""
+    )
 
-    # Extract text from the main body
     body_text = _process_blocks_for_text(
-        ast['blocks'],
+        ast["blocks"],
         math_store=math_store,
-        section_filter=config.SECTION_EXCLUDE_KEYWORDS
+        section_filter=config.SECTION_EXCLUDE_KEYWORDS,
     )
 
     full_text = ""
@@ -671,4 +709,15 @@ def parse_project_to_text(main_tex_file: Path) -> str:
     full_text = _postprocess_text(full_text, math_store)
 
     logger.info("Successfully extracted text from the LaTeX project.")
-    return full_text
+    return full_text, {
+        "pandoc_failed": False,
+        "fallback_used": False,
+        "fallback_mode": normalized_mode,
+        "llm_used": False,
+        "engine": "pandoc",
+    }
+
+
+def parse_project_to_text(main_tex_file: Path) -> str:
+    text, _meta = parse_project_to_text_with_meta(main_tex_file)
+    return text

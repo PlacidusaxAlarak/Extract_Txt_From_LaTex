@@ -2,3 +2,4 @@ pypandoc
 python-dotenv
 plasTeX
 pylatexenc
+openai
