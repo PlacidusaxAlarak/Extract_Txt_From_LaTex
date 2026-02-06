@@ -1,2 +1,4 @@
 pypandoc
 python-dotenv
+plasTeX
+pylatexenc
