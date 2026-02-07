@@ -2,6 +2,8 @@
 
 import logging
 import json
+import os
+import time
 try:
     import pypandoc
 except ModuleNotFoundError:
@@ -14,6 +16,38 @@ import config
 import subagent_cleaner
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_output_dir() -> Optional[Path]:
+    output_dir = os.getenv(
+        "PANDOC_DEBUG_OUTPUT_DIR",
+        "/inspire/hdd/global_user/lujiahao-253108120106/Tools/Test_data",
+    )
+    if not output_dir:
+        return None
+    path = Path(output_dir)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning(f"Failed to create debug output dir {path}: {exc}")
+        return None
+    return path
+
+
+def _write_debug_text(label: str, source_path: Optional[Path], text: str) -> None:
+    if not text:
+        return
+    out_dir = _debug_output_dir()
+    if out_dir is None:
+        return
+    base = source_path.stem if source_path else "latex"
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"{base}_{label}_{ts}.txt"
+    out_path = out_dir / filename
+    try:
+        out_path.write_text(text, encoding="utf-8")
+    except Exception as exc:
+        logger.warning(f"Failed to write debug text to {out_path}: {exc}")
 
 
 def _strip_latex_comments(text: str) -> str:
@@ -133,6 +167,97 @@ def _resolve_and_flatten_tex(main_file_path: Path, processed_files: Set[Path] = 
     return input_pattern.sub(replacer, content)
 
 
+def _resolve_and_collect_tex_chunks(
+    main_file_path: Path,
+    processed_files: Optional[Set[Path]] = None,
+    root_dir: Optional[Path] = None,
+) -> List[Tuple[str, str]]:
+    """Collect LaTeX source chunks by individual .tex files in include order."""
+    if processed_files is None:
+        processed_files = set()
+    if root_dir is None:
+        root_dir = main_file_path.parent.resolve()
+
+    if not main_file_path.exists():
+        logger.warning(f"Attempted to include a non-existent file: {main_file_path}")
+        return []
+
+    abs_path = main_file_path.resolve()
+    if abs_path in processed_files:
+        logger.warning(f"Circular dependency detected: {abs_path} has already been included. Skipping.")
+        return []
+
+    processed_files.add(abs_path)
+
+    try:
+        content = main_file_path.read_text(encoding='utf-8', errors='ignore')
+        content = content.replace('~', ' ')
+        content = _strip_latex_comments(content)
+    except Exception as e:
+        logger.error(f"Could not read file {main_file_path}: {e}")
+        return []
+
+    input_pattern = re.compile(r'\\(?:input|include|subfile)\b(?:\s*\{([^}]+)\}|\s+([^\s%]+))')
+    include_paths: List[Path] = []
+
+    def _collect_include_path(match: re.Match) -> str:
+        relative_path_str = match.group(1) or match.group(2)
+        if not relative_path_str.endswith('.tex'):
+            relative_path_str += '.tex'
+        include_paths.append(main_file_path.parent / relative_path_str)
+        return ""
+
+    local_content = input_pattern.sub(_collect_include_path, content).strip()
+
+    try:
+        source_name = str(abs_path.relative_to(root_dir)).replace('\\', '/')
+    except Exception:
+        source_name = main_file_path.name
+
+    chunks: List[Tuple[str, str]] = []
+    if local_content:
+        chunks.append((source_name, local_content))
+
+    for include_path in include_paths:
+        chunks.extend(
+            _resolve_and_collect_tex_chunks(
+                include_path,
+                processed_files=processed_files,
+                root_dir=root_dir,
+            )
+        )
+
+    return chunks
+
+
+def _prepare_llm_source_chunks(
+    main_tex_file: Path,
+    flattened_content: Optional[str] = None,
+) -> List[Tuple[str, str]]:
+    """Prepare source chunks for LLM cleanup, grouped by source .tex files."""
+    source_chunks = _resolve_and_collect_tex_chunks(main_tex_file)
+    if not source_chunks:
+        return []
+
+    if flattened_content is None:
+        flattened_content = "\n\n".join(text for _name, text in source_chunks)
+
+    macros = _extract_simple_macros(flattened_content)
+    prepared_chunks: List[Tuple[str, str]] = []
+
+    for source_name, source_text in source_chunks:
+        prepared = _strip_macro_definitions(source_text)
+        prepared = _apply_macros(prepared, macros)
+        prepared = _remove_bibliography_content(prepared)
+        prepared = _truncate_at_appendix(prepared)
+        prepared = _strip_cjk_envs(prepared)
+        prepared = prepared.strip()
+        if prepared:
+            prepared_chunks.append((source_name, prepared))
+
+    return prepared_chunks
+
+
 def _inlines_to_text(inlines: List[Dict[str, Any]], math_store: Optional[Dict[str, str]] = None) -> str:
     """Converts a list of Pandoc inline elements to a plain text string."""
     text = ""
@@ -204,6 +329,28 @@ def _extract_caption_text(caption: Any, math_store: Optional[Dict[str, str]] = N
         if len(caption) >= 2:
             return _extract_caption_text(caption[1], math_store)
     return ""
+
+
+def _extract_text_from_ast(ast: Dict[str, Any]) -> str:
+    math_store: Dict[str, str] = {}
+
+    title = _inlines_to_text(ast["meta"].get("title", {}).get("c", []), math_store) if config.KEEP_TITLE else ""
+    abstract = _inlines_to_text(ast["meta"].get("abstract", {}).get("c", []), math_store) if config.KEEP_ABSTRACT else ""
+
+    body_text = _process_blocks_for_text(
+        ast["blocks"],
+        math_store=math_store,
+        section_filter=config.SECTION_EXCLUDE_KEYWORDS,
+    )
+
+    full_text = ""
+    if title:
+        full_text += f"Title: {title}\n\n"
+    if abstract:
+        full_text += f"Abstract:\n{abstract}\n\n"
+    full_text += "--- Body ---\n\n" + body_text
+
+    return _postprocess_text(full_text, math_store)
 
 
 def _process_blocks_for_text(
@@ -591,21 +738,25 @@ def _normalize_fallback_mode(mode: Optional[str]) -> str:
     return normalized
 
 
-def _pandoc_to_ast_with_recovery(cleaned_content: str, extra_args: List[str]) -> Tuple[Optional[Dict[str, Any]], str]:
+def _pandoc_to_ast_with_recovery(
+    cleaned_content: str, extra_args: List[str]
+) -> Tuple[Optional[Dict[str, Any]], str, bool]:
     max_attempts = max(0, int(getattr(config, "PANDOC_RECOVERY_MAX_ATTEMPTS", 5)))
     window = max(1, int(getattr(config, "PANDOC_RECOVERY_WINDOW", 3)))
 
     working = cleaned_content
+    had_errors = False
     for attempt in range(max_attempts + 1):
         try:
             pandoc_ast_str = _run_pandoc_json(working, extra_args)
-            return json.loads(pandoc_ast_str), working
+            return json.loads(pandoc_ast_str), working, had_errors
         except Exception as e:
+            had_errors = True
             error_text = str(e)
             line_num = _extract_pandoc_error_line(error_text)
             if line_num is None or attempt >= max_attempts:
                 logger.error(f"Pandoc conversion failed after recovery attempts: {error_text}")
-                return None, working
+                return None, working, had_errors
 
             new_text, strategy = _drop_problem_segment(working, line_num, window, attempt)
             logger.warning(
@@ -650,32 +801,43 @@ def parse_project_to_text_with_meta(
     else:
         logger.warning(f"Lua filter not found at {lua_filter_path}. Proceeding without it.")
 
-    ast, recovered_content = _pandoc_to_ast_with_recovery(cleaned_content, extra_args)
+    ast, recovered_content, had_errors = _pandoc_to_ast_with_recovery(cleaned_content, extra_args)
     normalized_mode = _normalize_fallback_mode(fallback_mode)
 
-    if ast is None:
+    pandoc_text = None
+    if ast is not None:
+        pandoc_text = _extract_text_from_ast(ast)
+        _write_debug_text("pandoc", main_tex_file, pandoc_text)
+
+    if ast is None or had_errors:
         rule_text = _fallback_plain_text(recovered_content)
-        min_len = int(getattr(config, "SUBAGENT_MIN_OUTPUT_CHARS", 200))
         llm_used = False
         llm_text = None
 
-        if normalized_mode == "llm_only":
-            llm_text = subagent_cleaner.clean_latex_with_llm(recovered_content, config)
-        elif normalized_mode == "rule_then_llm" and len(rule_text) < min_len:
+        # Always attempt LLM cleanup when Pandoc reports any error or fails.
+        llm_chunks = _prepare_llm_source_chunks(main_tex_file, flattened_content)
+        if llm_chunks:
+            llm_text = subagent_cleaner.clean_latex_chunks_with_llm(llm_chunks, config)
+        else:
             llm_text = subagent_cleaner.clean_latex_with_llm(recovered_content, config)
 
         if llm_text:
             llm_used = True
+            logger.info("LLM cleanup triggered and produced output.")
+            _write_debug_text("llm", main_tex_file, llm_text)
             return llm_text, {
-                "pandoc_failed": True,
+                "pandoc_failed": ast is None,
+                "pandoc_had_errors": had_errors,
                 "fallback_used": True,
                 "fallback_mode": normalized_mode,
                 "llm_used": llm_used,
                 "engine": "pandoc",
             }
 
+        logger.info("LLM cleanup failed or produced no output; using rule-based fallback.")
         return rule_text, {
-            "pandoc_failed": True,
+            "pandoc_failed": ast is None,
+            "pandoc_had_errors": had_errors,
             "fallback_used": True,
             "fallback_mode": normalized_mode,
             "llm_used": llm_used,
@@ -685,32 +847,12 @@ def parse_project_to_text_with_meta(
     cleaned_content = recovered_content
 
     logger.info("Extracting text from Pandoc AST...")
-
-    math_store: Dict[str, str] = {}
-
-    title = _inlines_to_text(ast["meta"].get("title", {}).get("c", []), math_store) if config.KEEP_TITLE else ""
-    abstract = (
-        _inlines_to_text(ast["meta"].get("abstract", {}).get("c", []), math_store) if config.KEEP_ABSTRACT else ""
-    )
-
-    body_text = _process_blocks_for_text(
-        ast["blocks"],
-        math_store=math_store,
-        section_filter=config.SECTION_EXCLUDE_KEYWORDS,
-    )
-
-    full_text = ""
-    if title:
-        full_text += f"Title: {title}\n\n"
-    if abstract:
-        full_text += f"Abstract:\n{abstract}\n\n"
-    full_text += "--- Body ---\n\n" + body_text
-
-    full_text = _postprocess_text(full_text, math_store)
+    full_text = pandoc_text if pandoc_text is not None else _extract_text_from_ast(ast)
 
     logger.info("Successfully extracted text from the LaTeX project.")
     return full_text, {
         "pandoc_failed": False,
+        "pandoc_had_errors": had_errors,
         "fallback_used": False,
         "fallback_mode": normalized_mode,
         "llm_used": False,
