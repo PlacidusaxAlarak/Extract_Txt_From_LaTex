@@ -14,9 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def _prepare_chunks(main_tex_file: Path):
-    flattened_content = pandoc_parser._resolve_and_flatten_tex(main_tex_file)
-    flattened_content = pandoc_parser._strip_latex_comments(flattened_content)
-    return pandoc_parser._prepare_llm_source_chunks(main_tex_file, flattened_content)
+    return pandoc_parser._prepare_llm_source_chunks_raw(main_tex_file)
 
 
 def parse_project_to_text(main_tex_file: Path) -> str:

@@ -51,9 +51,16 @@ def _append_cleanup_log(log_file: Optional[Path], text: str) -> None:
 
 def _build_system_prompt() -> str:
     return (
-        "You clean LaTeX into plain text. Output only cleaned text. "
-        "Do not add explanations or Markdown. Keep math in $...$ or $$...$$ when present. "
-        "Remove LaTeX commands and formatting but preserve readable content."
+        "You are a strict LaTeX cleaner. Output only cleaned text content. "
+        "Do not output explanations or code fences. "
+        "Keep Markdown headings if they already exist in the text. "
+        "Rule 1: Remove citation/cross-reference/bibliography tokens such as \\cite*, \\ref, \\eqref, \\label, \\bibliography. "
+        "Rule 2: Remove image information completely: delete \\includegraphics, figure environment wrappers, image file paths, width/height/alignment options, and rendering-only image commands. "
+        "If a figure caption exists, keep only one plain line like 'Figure: <caption>'. "
+        "Rule 3: Preserve table layout and tabular formatting/content; do not flatten or discard table structure. "
+        "Rule 4: Remove custom macro declarations and custom macro symbols (for example \\newcommand, \\def, \\renewcommand, \\spmath, \\RR, \\NN). "
+        "If a custom macro clearly represents a plain word, keep the word without the backslash; otherwise delete the macro token. "
+        "Rule 5: Preserve readable prose and equations in $...$ or $$...$$ when possible while removing non-semantic command shells."
     )
 
 
@@ -120,18 +127,31 @@ def clean_latex_chunks_with_llm(
 
     system_prompt = _build_system_prompt()
 
+    def _run_llm_once(prompt: str, payload: str) -> str:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": payload},
+            ],
+            temperature=0.0,
+        )
+        content = response.choices[0].message.content if response.choices else ""
+        return content.strip() if content else ""
+
     outputs: List[str] = []
     total = len(normalized_chunks)
     for index, (source_name, source_text) in enumerate(normalized_chunks, start=1):
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": source_text},
-                ],
-                temperature=0.0,
-            )
+            cleaned = _run_llm_once(system_prompt, source_text)
+            if not cleaned:
+                # Second attempt: force coverage instead of dropping content.
+                retry_prompt = (
+                    system_prompt
+                    + " IMPORTANT: Do not omit content. If cleaning would remove everything, "
+                    + "return the input unchanged."
+                )
+                cleaned = _run_llm_once(retry_prompt, source_text)
         except Exception as exc:
             logger.warning(f"LLM cleanup failed on source '{source_name}': {exc}")
             _append_cleanup_log(
@@ -144,34 +164,23 @@ def clean_latex_chunks_with_llm(
             )
             return None
 
-        content = response.choices[0].message.content if response.choices else ""
-        if content:
-            cleaned = content.strip()
-            if cleaned:
-                outputs.append(cleaned)
-                _append_cleanup_log(
-                    log_file,
-                    (
-                        f"run={run_id} status=ok chunk={index}/{total} source={source_name} "
-                        f"input_chars={len(source_text)} output_chars={len(cleaned)}\n"
-                        f"--- CLEANED RESULT START ({source_name}) ---\n"
-                        f"{cleaned}\n"
-                        f"--- CLEANED RESULT END ({source_name}) ---\n"
-                    ),
-                )
-            else:
-                _append_cleanup_log(
-                    log_file,
-                    (
-                        f"run={run_id} status=empty chunk={index}/{total} source={source_name} "
-                        f"input_chars={len(source_text)}\n"
-                    ),
-                )
+        if cleaned:
+            outputs.append(cleaned)
+            _append_cleanup_log(
+                log_file,
+                (
+                    f"run={run_id} status=ok chunk={index}/{total} source={source_name} "
+                    f"input_chars={len(source_text)} output_chars={len(cleaned)}\n"
+                    f"--- CLEANED RESULT START ({source_name}) ---\n"
+                    f"{cleaned}\n"
+                    f"--- CLEANED RESULT END ({source_name}) ---\n"
+                ),
+            )
         else:
             _append_cleanup_log(
                 log_file,
                 (
-                    f"run={run_id} status=no_content chunk={index}/{total} source={source_name} "
+                    f"run={run_id} status=empty chunk={index}/{total} source={source_name} "
                     f"input_chars={len(source_text)}\n"
                 ),
             )

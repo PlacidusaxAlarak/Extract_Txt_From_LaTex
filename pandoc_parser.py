@@ -65,6 +65,73 @@ def _strip_cjk_envs(text: str) -> str:
     return text
 
 
+def _extract_document_body(text: str) -> str:
+    """Return only the content between \\begin{document} and \\end{document} when present."""
+    if not text:
+        return text
+    begin_match = re.search(r'\\begin\{document\}', text, flags=re.IGNORECASE)
+    if begin_match:
+        text = text[begin_match.end():]
+    end_match = re.search(r'\\end\{document\}', text, flags=re.IGNORECASE)
+    if end_match:
+        text = text[:end_match.start()]
+    return text
+
+
+def _extract_braced_content(text: str, brace_start: int) -> tuple[str, int]:
+    """Return content inside braces starting at brace_start (the '{' index)."""
+    depth = 0
+    start = None
+    for idx in range(brace_start, len(text)):
+        ch = text[idx]
+        if ch == '{':
+            depth += 1
+            if depth == 1:
+                start = idx + 1
+        elif ch == '}' and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start:idx], idx + 1
+    return "", brace_start
+
+
+def _normalize_section_title(title: str) -> str:
+    cleaned = re.sub(r'\\[a-zA-Z@]+\\*?', '', title)
+    cleaned = cleaned.replace('~', ' ')
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
+def _split_body_into_section_chunks(body_text: str) -> List[Tuple[str, str]]:
+    """Split LaTeX body into section chunks to preserve coverage."""
+    if not body_text:
+        return []
+    section_re = re.compile(r'\\(?:sub)*section\\*?(?:\[[^\]]*\])?\{', flags=re.IGNORECASE)
+    matches = list(section_re.finditer(body_text))
+    if not matches:
+        cleaned = body_text.strip()
+        return [("section:body", cleaned)] if cleaned else []
+
+    chunks: List[Tuple[str, str]] = []
+    first_start = matches[0].start()
+    if body_text[:first_start].strip():
+        chunks.append(("section:front-matter", body_text[:first_start].strip()))
+
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body_text)
+        chunk_text = body_text[start:end].strip()
+        if not chunk_text:
+            continue
+        title, _ = _extract_braced_content(body_text, match.end() - 1)
+        title = _normalize_section_title(title)
+        label = f"section:{idx + 1}"
+        if title:
+            label = f"section:{idx + 1}:{title[:60]}"
+        chunks.append((label, chunk_text))
+    return chunks
+
+
 def _extract_simple_macros(text: str) -> Dict[str, str]:
     """Extract simple zero-argument macros from \\newcommand/\\renewcommand/\\def."""
     macros: Dict[str, str] = {}
@@ -193,6 +260,7 @@ def _resolve_and_collect_tex_chunks(
         content = main_file_path.read_text(encoding='utf-8', errors='ignore')
         content = content.replace('~', ' ')
         content = _strip_latex_comments(content)
+        content = _extract_document_body(content)
     except Exception as e:
         logger.error(f"Could not read file {main_file_path}: {e}")
         return []
@@ -256,6 +324,14 @@ def _prepare_llm_source_chunks(
             prepared_chunks.append((source_name, prepared))
 
     return prepared_chunks
+
+
+def _prepare_llm_source_chunks_raw(main_tex_file: Path) -> List[Tuple[str, str]]:
+    """Prepare raw source chunks for pure-LLM cleanup with no rule preprocessing."""
+    flattened = _resolve_and_flatten_tex(main_tex_file)
+    flattened = _strip_latex_comments(flattened)
+    body = _extract_document_body(flattened)
+    return _split_body_into_section_chunks(body)
 
 
 def _inlines_to_text(inlines: List[Dict[str, Any]], math_store: Optional[Dict[str, str]] = None) -> str:
@@ -815,11 +891,11 @@ def parse_project_to_text_with_meta(
         llm_text = None
 
         # Always attempt LLM cleanup when Pandoc reports any error or fails.
-        llm_chunks = _prepare_llm_source_chunks(main_tex_file, flattened_content)
+        llm_chunks = _prepare_llm_source_chunks_raw(main_tex_file)
         if llm_chunks:
             llm_text = subagent_cleaner.clean_latex_chunks_with_llm(llm_chunks, config)
         else:
-            llm_text = subagent_cleaner.clean_latex_with_llm(recovered_content, config)
+            llm_text = subagent_cleaner.clean_latex_with_llm(flattened_content, config)
 
         if llm_text:
             llm_used = True
